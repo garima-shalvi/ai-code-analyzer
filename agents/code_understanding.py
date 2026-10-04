@@ -111,6 +111,7 @@ def analyze_code(code):
         "subscript_access_count": subscript_access_count,
         "max_nesting_depth": get_max_nesting(tree),
         "loop_details": get_loop_details(tree),
+        "space_complexity": get_space_complexity(tree),
         "recursive_functions": sorted(recursive_functions),
         "function_relationships": function_relationships,
         "variable_scope": variable_scope
@@ -159,6 +160,51 @@ def get_loop_bound_type(node):
 
     return "unknown"
 
+def get_space_complexity(tree):
+    max_space = 0
+
+    for node in ast.walk(tree):
+
+        if isinstance(node, ast.ListComp):
+            depth = 1
+
+            if isinstance(node.elt, ast.ListComp):
+                depth = 2
+
+            elif isinstance(node.elt, ast.BinOp):
+                if isinstance(node.elt.left, ast.List):
+                    depth = 2
+
+            max_space = max(max_space, depth)
+
+        elif isinstance(node, ast.BinOp):
+            if (
+                isinstance(node.op, ast.Mult)
+                and (
+                    isinstance(node.left, ast.List)
+                    or isinstance(node.right, ast.List)
+                )
+                and (
+                    isinstance(node.left, ast.Name)
+                    or isinstance(node.right, ast.Name)
+                )
+            ):
+                max_space = max(max_space, 1)
+
+        elif isinstance(node, ast.List):
+            is_constant = True
+
+            for element in node.elts:
+                if isinstance(element, ast.Name):
+                    is_constant = False
+
+            if not is_constant:
+                max_space = max(max_space, 1)
+
+        elif isinstance(node, (ast.Dict, ast.Set)):
+            max_space = max(max_space, 1)
+
+    return max_space
 
 def get_loop_details(node, depth=0):
     loops = []
@@ -180,16 +226,11 @@ def get_loop_details(node, depth=0):
 if __name__ == "__main__":
 
     code = """
-for i in range(n):
-    for j in range(10):
-        print(i, j)
+def test(n):
+    matrix = [[0] * n for _ in range(n)]
+    return matrix
 """
 
     result = analyze_code(code)
 
-    print("Loop Count:", result["features"]["loop_count"])
-    print("Max Loop Nesting:", result["features"]["max_loop_nesting"])
-    print("Loop Details:")
-
-    for loop in result["features"]["loop_details"]:
-        print(loop)
+    print("Space Complexity:", result["features"]["space_complexity"])
