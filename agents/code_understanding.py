@@ -113,7 +113,7 @@ def analyze_code(code):
         "function_relationships": function_relationships,
         "variable_scope": variable_scope
     }
-    return create_representation(features)
+    return create_representation(features, tree)
 
 
 if __name__ == "__main__":
@@ -126,6 +126,7 @@ def find_max(arr):
     return max_val
 """
 
-import json
-result = analyze_code(code)
-print(json.dumps(result, indent=2))
+    result = analyze_code(code)
+
+    print(result["features"])
+    print(type(result["tree"]))
