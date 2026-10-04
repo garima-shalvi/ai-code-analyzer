@@ -105,28 +105,91 @@ def analyze_code(code):
     features = {
         "function_count": function_count,
         "loop_count": loop_count,
+        "max_loop_nesting": get_max_loop_nesting(tree),
         "condition_count": condition_count,
         "call_count": call_count,
         "subscript_access_count": subscript_access_count,
         "max_nesting_depth": get_max_nesting(tree),
+        "loop_details": get_loop_details(tree),
         "recursive_functions": sorted(recursive_functions),
         "function_relationships": function_relationships,
         "variable_scope": variable_scope
     }
     return create_representation(features, tree)
+def get_max_loop_nesting(node, depth=0):
+    max_depth = depth
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.For, ast.While)):
+            max_depth = max(
+                max_depth,
+                get_max_loop_nesting(child, depth + 1)
+            )
+        else:
+            max_depth = max(
+                max_depth,
+                get_max_loop_nesting(child, depth)
+            )
+
+    return max_depth
+
+def get_loop_bound_type(node):
+    if isinstance(node, ast.For):
+        iterator = node.iter
+
+        if (
+            isinstance(iterator, ast.Call)
+            and isinstance(iterator.func, ast.Name)
+            and iterator.func.id == "range"
+        ):
+            if len(iterator.args) == 1:
+                argument = iterator.args[0]
+
+                if isinstance(argument, ast.Constant):
+                    return "constant"
+
+                return "input-dependent"
+
+            return "input-dependent"
+
+        return "unknown"
+
+    if isinstance(node, ast.While):
+        return "unknown"
+
+    return "unknown"
 
 
+def get_loop_details(node, depth=0):
+    loops = []
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.For, ast.While)):
+            loops.append({
+                "line": child.lineno,
+                "type": "for" if isinstance(child, ast.For) else "while",
+                "bound_type": get_loop_bound_type(child),
+                "nesting_depth": depth + 1
+            })
+
+            loops.extend(get_loop_details(child, depth + 1))
+        else:
+            loops.extend(get_loop_details(child, depth))
+
+    return loops
 if __name__ == "__main__":
+
     code = """
-def find_max(arr):
-    max_val = 0
-    for x in arr:
-        if x > max_val:
-            max_val = x
-    return max_val
+for i in range(n):
+    for j in range(10):
+        print(i, j)
 """
 
     result = analyze_code(code)
 
-    print(result["features"])
-    print(type(result["tree"]))
+    print("Loop Count:", result["features"]["loop_count"])
+    print("Max Loop Nesting:", result["features"]["max_loop_nesting"])
+    print("Loop Details:")
+
+    for loop in result["features"]["loop_details"]:
+        print(loop)

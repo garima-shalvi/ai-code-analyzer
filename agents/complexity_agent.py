@@ -48,23 +48,61 @@ def detect_complexity(representation):
     findings.extend(detect_recursive_functions(representation))
 
     return findings
-    
+
+def estimate_time_complexity(representation):
+    findings = []
+
+    loops = representation["features"]["loop_details"]
+
+    if not loops:
+        complexity = "O(1)"
+    else:
+        max_degree = 0
+
+        for loop in loops:
+            if loop["bound_type"] == "input-dependent":
+                degree = loop["nesting_depth"]
+            else:
+                degree = loop["nesting_depth"] - 1
+
+            max_degree = max(max_degree, degree)
+
+        if max_degree == 0:
+            complexity = "O(1)"
+        elif max_degree == 1:
+            complexity = "O(n)"
+        else:
+            complexity = f"O(n^{max_degree})"
+
+    findings.append(create_finding(
+        rule_id="TIME_COMPLEXITY",
+        source="complexity_analysis",
+        category="time-complexity",
+        message=f"Estimated time complexity: {complexity}.",
+        line=1,
+        column=0,
+        severity="info",
+        confidence=0.90,
+        evidence=f"Loop details: {loops}"
+    ))
+
+    return findings
+
 if __name__ == "__main__":
     from agents.code_understanding import analyze_code
 
     code = """
 def test(n):
-    if n > 0:
-        for i in range(n):
-            while i < n:
-                if i > 2:
-                    return test(n - 1)
-    return 0
+    for i in range(n):
+       print(i)
+
+    for j in range(n):
+       print(j)
 """
 
     representation = analyze_code(code)
 
-    findings = detect_complexity(representation)
+    findings = estimate_time_complexity(representation)
 
     for finding in findings:
         print(finding)
