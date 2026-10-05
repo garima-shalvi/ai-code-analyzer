@@ -235,6 +235,7 @@ def get_function_features(function):
     subscript_access_count = 0
 
     for node in ast.walk(function):
+
         if isinstance(node, (ast.For, ast.While)):
             loop_count += 1
 
@@ -258,7 +259,6 @@ def get_function_features(function):
         "is_recursive": int(is_function_recursive(function)),
         "function_length": function.end_lineno - function.lineno + 1
     }
-
 def extract_function_features(code):
     try:
         tree = ast.parse(code)
