@@ -283,6 +283,27 @@ def is_function_recursive(function):
 
     return False
 
+def get_target_function(code, method):
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    method = method.strip()
+
+    if method.startswith("class "):
+        return None
+
+    if method.startswith("def "):
+        method = method[4:]
+
+    function_name = method.split("(")[0].strip()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            return node
+
+    return None
 
 if __name__ == "__main__":
     valid_code = """
