@@ -219,17 +219,85 @@ def get_loop_details(node, depth=0):
             loops.extend(get_loop_details(child, depth))
 
     return loops
-if __name__ == "__main__":
+def get_functions(tree):
+    functions = []
 
-    code = """
-  def total(items):
-    s = 0
-    for item in items:
-        s += item
-    return s
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            functions.append(node)
+
+    return functions
+
+def get_function_features(function):
+    loop_count = 0
+    condition_count = 0
+    call_count = 0
+    subscript_access_count = 0
+
+    for node in ast.walk(function):
+        if isinstance(node, (ast.For, ast.While)):
+            loop_count += 1
+
+        elif isinstance(node, ast.If):
+            condition_count += 1
+
+        elif isinstance(node, ast.Call):
+            call_count += 1
+
+        elif isinstance(node, ast.Subscript):
+            subscript_access_count += 1
+
+    return {
+        "function_name": function.name,
+        "loop_count": loop_count,
+        "condition_count": condition_count,
+        "call_count": call_count,
+        "subscript_access_count": subscript_access_count,
+        "max_nesting_depth": get_max_nesting(function),
+        "max_loop_nesting": get_max_loop_nesting(function),
+        "is_recursive": int(is_function_recursive(function)),
+        "function_length": function.end_lineno - function.lineno + 1
+    }
+
+def extract_function_features(code):
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    functions = get_functions(tree)
+
+    features = []
+
+    for function in functions:
+        features.append(get_function_features(function))
+
+    return features
+
+def is_function_recursive(function):
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id == function.name:
+                    return True
+
+    return False
+
+
+if __name__ == "__main__":
+    valid_code = """
+def add(a, b):
+    return a + b
+
+def factorial(n):
+    if n == 0:
+        return 1
+    return n * factorial(n - 1)
 """
 
-    result = analyze_code(code)
+    invalid_code = """
+def broken(
+"""
 
-    print("Loop Count:", result["features"]["loop_count"])
-    print("Loop Details:", result["features"]["loop_details"])
+    print(extract_function_features(valid_code))
+    print(extract_function_features(invalid_code))
