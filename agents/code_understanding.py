@@ -135,28 +135,24 @@ def get_max_loop_nesting(node, depth=0):
     return max_depth
 
 def get_loop_bound_type(node):
-    if isinstance(node, ast.For):
-        iterator = node.iter
+    if not isinstance(node, ast.For):
+        return "unknown"
 
-        if (
-            isinstance(iterator, ast.Call)
-            and isinstance(iterator.func, ast.Name)
-            and iterator.func.id == "range"
-        ):
-            if len(iterator.args) == 1:
-                argument = iterator.args[0]
+    iterable = node.iter
 
-                if isinstance(argument, ast.Constant):
-                    return "constant"
-
+    if isinstance(iterable, ast.Call):
+        if isinstance(iterable.func, ast.Name) and iterable.func.id == "range":
+            for arg in iterable.args:
+                if isinstance(arg, ast.Constant):
+                    continue
                 return "input-dependent"
+            return "constant"
 
-            return "input-dependent"
+    if isinstance(iterable, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Constant)):
+        return "constant"
 
-        return "unknown"
-
-    if isinstance(node, ast.While):
-        return "unknown"
+    if isinstance(iterable, ast.Name):
+        return "input-dependent"
 
     return "unknown"
 
@@ -226,11 +222,14 @@ def get_loop_details(node, depth=0):
 if __name__ == "__main__":
 
     code = """
-def test(n):
-    matrix = [[0] * n for _ in range(n)]
-    return matrix
+  def total(items):
+    s = 0
+    for item in items:
+        s += item
+    return s
 """
 
     result = analyze_code(code)
 
-    print("Space Complexity:", result["features"]["space_complexity"])
+    print("Loop Count:", result["features"]["loop_count"])
+    print("Loop Details:", result["features"]["loop_details"])

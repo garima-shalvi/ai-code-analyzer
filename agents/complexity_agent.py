@@ -119,14 +119,14 @@ if __name__ == "__main__":
     from agents.code_understanding import analyze_code
 
     code = """
-def test(n):
-    arr = [1, 2, 3, 4]
-    return arr
+def test():
+    for i in range(10):
+        print(i)
 """
 
     representation = analyze_code(code)
 
-    findings = estimate_space_complexity(representation)
+    findings = estimate_time_complexity(representation)
 
     for finding in findings:
         print(finding)
