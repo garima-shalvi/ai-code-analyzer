@@ -5,10 +5,10 @@ def generate_report(result):
     complexity = []
 
     for finding in findings:
-        if finding["source"] == "static_rule":
-            bugs.append(finding)
-        elif finding["source"] == "complexity_rule":
-            complexity.append(finding)
+      if finding["source"] == "static_rule":
+        bugs.append(finding)
+      elif finding["source"] in ("complexity_rule", "complexity_analysis"):
+        complexity.append(finding)
 
     print("AI Code Analysis Report")
     print("=======================")

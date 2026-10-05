@@ -20,7 +20,10 @@ def analyze_source(code):
         "representation": representation,
         "findings": findings
     }
+
 if __name__ == "__main__":
+    from report import generate_report
+
     code = """
 def process(items=[]):
     try:
@@ -40,5 +43,4 @@ def process(items=[]):
 
     result = analyze_source(code)
 
-    for finding in result["findings"]:
-        print(finding)
+    generate_report(result)
