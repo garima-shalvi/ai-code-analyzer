@@ -481,17 +481,14 @@ def extract_features(code):
 # ---------------------------------------------------------------
 
 CLASS_ORDER = ["constant", "logn", "linear", "nlogn", "quadratic", "cubic", "np"]
-
-
 def rule_based_estimate(features):
-    """Return one of CLASS_ORDER using hand-written rules only."""
-    # exponential / brute-force indicators
     if features["exp_patterns"] > 0:
         return "np"
     if features["max_self_calls"] >= 2 and not features["uses_memo"]:
         return "np"
 
     degree = features["max_poly_loop_nesting"]
+
     has_log = (
         features["max_log_loop_nesting"] > 0
         or features["sort_calls"] > 0
@@ -499,8 +496,10 @@ def rule_based_estimate(features):
         or features["bisect_ops"] > 0
     )
 
-    # hidden linear work (sum(x), max(x), ...) inside a loop adds a level
     if features["implicit_linear_in_loop"] > 0 and degree >= 1:
+        degree += 1
+
+    if (features["sort_in_loop"] > 0 or features["heap_ops"] > 0 or features["bisect_ops"] > 0) and degree >= 1:
         degree += 1
 
     if degree >= 3:
@@ -509,7 +508,7 @@ def rule_based_estimate(features):
         return "quadratic"
     if degree == 1:
         return "nlogn" if has_log else "linear"
-    # no input-dependent polynomial loops
     if has_log:
         return "logn" if features["sort_calls"] == 0 else "nlogn"
     return "constant"
+

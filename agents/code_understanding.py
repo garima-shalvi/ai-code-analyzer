@@ -116,7 +116,7 @@ def analyze_code(code):
         "function_relationships": function_relationships,
         "variable_scope": variable_scope
     }
-    return create_representation(features, tree)
+    return create_representation(features, tree,code)
 def get_max_loop_nesting(node, depth=0):
     max_depth = depth
 
@@ -259,6 +259,7 @@ def get_function_features(function):
         "is_recursive": int(is_function_recursive(function)),
         "function_length": function.end_lineno - function.lineno + 1
     }
+
 def extract_function_features(code):
     try:
         tree = ast.parse(code)
