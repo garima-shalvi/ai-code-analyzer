@@ -5,11 +5,13 @@ import numpy as np
 
 from representation.finding import create_finding
 from ml.complexity_features import extract_features, rule_based_estimate
+from ml.extra_features import extra_features
 
 MODEL_PATH = "models/complexity_model.joblib"
 
-# If the ML model is less sure than this, trust the rule-based estimate.
-ML_CONFIDENCE_THRESHOLD = 0.50
+
+ML_MIN_CONFIDENCE = 0.50
+MAX_CLASS_GAP = 1
 
 _complexity_model = None
 
@@ -26,9 +28,8 @@ def load_complexity_model():
     return _complexity_model
 
 
-# ---------------------------------------------------------------
 # Rule-only detectors
-# ---------------------------------------------------------------
+
 def detect_deep_nesting(representation):
     findings = []
     depth = representation["features"]["max_nesting_depth"]
@@ -91,11 +92,11 @@ def estimate_space_complexity(representation):
     )]
 
 
-# ---------------------------------------------------------------
+
 # Time complexity: rule, ML, and the hybrid that combines them
-# ---------------------------------------------------------------
+
 def estimate_time_complexity(representation):
-    """Rule-based estimate only (kept for tests and comparison)."""
+    
     features = extract_features(representation["code"])
     complexity = rule_based_estimate(features)
 
@@ -112,14 +113,19 @@ def estimate_time_complexity(representation):
     )]
 
 
-def _ml_predict(features, rule_idx, data):
+def _ml_predict(features, rule_idx, data, code):
     """Return (ml_index, ml_confidence, top3_text) for one program."""
     order = data["class_order"]
 
-    X = np.array(
-        [features[name] for name in data["feature_names"]] + [rule_idx],
-        dtype=float,
-    ).reshape(1, -1)
+    values = [features[name] for name in data["feature_names"]] + [rule_idx]
+
+    # models saved with extra features also need those, in the saved order
+    extra_names = data.get("extra_names")
+    if extra_names:
+        extras = extra_features(code)
+        values += [extras[name] for name in extra_names]
+
+    X = np.array(values, dtype=float).reshape(1, -1)
 
     probs = data["model"].predict_proba(X)[0]
     classes = [int(c) for c in data["model"].classes_]
@@ -132,11 +138,13 @@ def _ml_predict(features, rule_idx, data):
 
 def estimate_time_complexity_hybrid(representation):
     """
-    Final time-complexity answer. The rule engine decides the class; the
-    Random Forest acts as a second opinion:
-      - they agree     -> rule class, high confidence
-      - they disagree  -> rule class, lower confidence, flagged for review
-                          (lowest confidence when ML is itself confident)
+    Final time-complexity answer. The trained model decides the class (the
+    rule engine's estimate is one of its input features); the rule estimate
+    is reported as a second opinion:
+      - they agree                              -> that class, high confidence
+      - they disagree, ML sure and close        -> ML class, ML probability
+      - ML unsure (< 0.50) or 2+ classes away   -> rule class (safety net)
+    If the model file is missing, the rule-based estimate is used instead.
     """
     features = extract_features(representation["code"])
     rule_label = rule_based_estimate(features)
@@ -159,24 +167,25 @@ def estimate_time_complexity_hybrid(representation):
 
     order = data["class_order"]
     rule_idx = order.index(rule_label)
-    ml_idx, ml_conf, top3 = _ml_predict(features, rule_idx, data)
+    ml_idx, ml_conf, top3 = _ml_predict(
+        features, rule_idx, data, representation["code"]
+    )
     ml_label = order[ml_idx]
 
-    # The rule engine is authoritative for the class. ML only adjusts
-    # confidence and flags disagreement.
-    if ml_label == rule_label:
-        final = rule_label
-        conf = min(0.99, 0.6 + ml_conf / 2)
-        note = "rule and ML agree"
-    else:
-          final = rule_label
+    # The trained model decides the class (it beats the rule engine in grouped
+    # cross-validation). A safety net falls back to the rule estimate when the
+    # model is unsure or contradicts the rules by a wide margin.
+    gap = abs(ml_idx - rule_idx)
 
-          if ml_conf >= ML_CONFIDENCE_THRESHOLD:
-            conf = 0.55
-            note = f"ML suggests {ml_label}; review manually"
-          else:
-            conf = 0.65
-            note = f"ML weakly suggests {ml_label}"
+    if ml_label == rule_label:
+        final, conf = ml_label, min(0.99, 0.6 + ml_conf / 2)
+        note = "ML and rule engine agree"
+    elif ml_conf < ML_MIN_CONFIDENCE or gap > MAX_CLASS_GAP:
+        final, conf = rule_label, 0.65
+        note = f"rule engine used; ML suggested {ml_label} ({ml_conf:.2f}), too unsure or too far off"
+    else:
+        final, conf = ml_label, ml_conf
+        note = f"ML prediction; rule engine estimated {rule_label}"
 
     agreement = "yes" if ml_label == rule_label else "no"
 
