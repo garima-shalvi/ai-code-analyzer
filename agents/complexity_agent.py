@@ -1,3 +1,4 @@
+
 import os
 
 import joblib
@@ -9,9 +10,11 @@ from ml.extra_features import extra_features
 
 MODEL_PATH = "models/complexity_model.joblib"
 
-
 ML_MIN_CONFIDENCE = 0.50
-MAX_CLASS_GAP = 1
+ACCEPT_AGREEMENT = True
+
+# Measured accuracy of the rule engine alone in grouped cross-validation.
+RULE_ONLY_CONFIDENCE = 0.50
 
 _complexity_model = None
 
@@ -92,11 +95,10 @@ def estimate_space_complexity(representation):
     )]
 
 
-
-# Time complexity: rule, ML, and the hybrid that combines them
+# Time complexity
 
 def estimate_time_complexity(representation):
-    
+    """Rule-based estimate only (kept for tests and comparison)."""
     features = extract_features(representation["code"])
     complexity = rule_based_estimate(features)
 
@@ -108,15 +110,32 @@ def estimate_time_complexity(representation):
         line=1,
         column=0,
         severity="info",
-        confidence=0.90,
+        confidence=RULE_ONLY_CONFIDENCE,
         evidence=f"Rule-based complexity estimate: {complexity}",
     )]
 
 
-def _ml_predict(features, rule_idx, data, code):
-    """Return (ml_index, ml_confidence, top3_text) for one program."""
-    order = data["class_order"]
+def decide(rule_idx, proba, threshold=None, accept_agreement=None):
+    """Decide what to report. Returns (class_index or None, status).
 
+    A pure function of the rule estimate and the model's probabilities, so
+    ml/validate_policy.py evaluates exactly the logic the agent runs.
+    """
+    threshold = ML_MIN_CONFIDENCE if threshold is None else threshold
+    accept_agreement = ACCEPT_AGREEMENT if accept_agreement is None else accept_agreement
+
+    ml_idx = int(np.argmax(proba))
+    ml_conf = float(proba[ml_idx])
+
+    if ml_conf >= threshold:
+        return ml_idx, "confident"
+    if accept_agreement and ml_idx == rule_idx:
+        return ml_idx, "agreed"
+    return None, "abstained"
+
+
+def _ml_probabilities(features, rule_idx, data, code):
+    """Model probabilities as a vector in class_order order."""
     values = [features[name] for name in data["feature_names"]] + [rule_idx]
 
     # models saved with extra features also need those, in the saved order
@@ -127,67 +146,77 @@ def _ml_predict(features, rule_idx, data, code):
 
     X = np.array(values, dtype=float).reshape(1, -1)
 
-    probs = data["model"].predict_proba(X)[0]
-    classes = [int(c) for c in data["model"].classes_]
-    ranked = sorted(zip(classes, probs), key=lambda p: -p[1])
+    model = data["model"]
+    expected = getattr(model, "n_features_in_", X.shape[1])
+    if X.shape[1] != expected:
+        raise ValueError(
+            f"model expects {expected} features but {X.shape[1]} were built; "
+            f"retrain with: python -m ml.save_complexity_model"
+        )
 
-    ml_idx, ml_conf = ranked[0]
-    top3 = ", ".join(f"{order[i]}={p:.2f}" for i, p in ranked[:3])
-    return ml_idx, float(ml_conf), top3
+    raw = model.predict_proba(X)[0]
+    proba = np.zeros(len(data["class_order"]))
+    for column, cls in enumerate(model.classes_):
+        proba[int(cls)] = raw[column]
+    return proba
+
+
+def _rule_only_finding(rule_label, reason):
+    return create_finding(
+        rule_id="TIME_COMPLEXITY",
+        source="complexity_rule",
+        category="time-complexity",
+        message=f"Time complexity: {rule_label} (rule-based; {reason}).",
+        line=1,
+        column=0,
+        severity="info",
+        confidence=RULE_ONLY_CONFIDENCE,
+        evidence=f"Rule estimate: {rule_label} | ML: unavailable ({reason})",
+    )
 
 
 def estimate_time_complexity_hybrid(representation):
-    """
-    Final time-complexity answer. The trained model decides the class (the
-    rule engine's estimate is one of its input features); the rule estimate
-    is reported as a second opinion:
-      - they agree                              -> that class, high confidence
-      - they disagree, ML sure and close        -> ML class, ML probability
-      - ML unsure (< 0.50) or 2+ classes away   -> rule class (safety net)
-    If the model file is missing, the rule-based estimate is used instead.
-    """
-    features = extract_features(representation["code"])
+    """Final time-complexity finding: a class, or UNKNOWN when evidence is too weak."""
+    code = representation["code"]
+    features = extract_features(code)
     rule_label = rule_based_estimate(features)
 
     data = load_complexity_model()
-
-    # No trained model available: fall back to rules only.
     if data is None:
-        return [create_finding(
-            rule_id="TIME_COMPLEXITY",
-            source="complexity_rule",
-            category="time-complexity",
-            message=f"Time complexity: {rule_label} (rule-based; ML model not found).",
-            line=1,
-            column=0,
-            severity="info",
-            confidence=0.70,
-            evidence=f"Rule estimate: {rule_label} | ML: unavailable",
-        )]
+        return [_rule_only_finding(rule_label, "ML model not found")]
 
     order = data["class_order"]
     rule_idx = order.index(rule_label)
-    ml_idx, ml_conf, top3 = _ml_predict(
-        features, rule_idx, data, representation["code"]
-    )
+
+    try:
+        proba = _ml_probabilities(features, rule_idx, data, code)
+    except Exception as exc:
+        return [_rule_only_finding(rule_label, f"ML unavailable: {exc}")]
+
+    final_idx, status = decide(rule_idx, proba)
+
+    ml_idx = int(np.argmax(proba))
     ml_label = order[ml_idx]
+    ml_conf = float(proba[ml_idx])
+    agree = ml_label == rule_label
 
-    # The trained model decides the class (it beats the rule engine in grouped
-    # cross-validation). A safety net falls back to the rule estimate when the
-    # model is unsure or contradicts the rules by a wide margin.
-    gap = abs(ml_idx - rule_idx)
-
-    if ml_label == rule_label:
-        final, conf = ml_label, min(0.99, 0.6 + ml_conf / 2)
-        note = "ML and rule engine agree"
-    elif ml_conf < ML_MIN_CONFIDENCE or gap > MAX_CLASS_GAP:
-        final, conf = rule_label, 0.65
-        note = f"rule engine used; ML suggested {ml_label} ({ml_conf:.2f}), too unsure or too far off"
+    if status == "confident":
+        final = ml_label
+        note = "ML and rule engine agree" if agree else (
+            f"ML prediction; rule engine estimated {rule_label}"
+        )
+    elif status == "agreed":
+        final = ml_label
+        note = "ML and rule engine agree, but ML confidence is low"
     else:
-        final, conf = ml_label, ml_conf
-        note = f"ML prediction; rule engine estimated {rule_label}"
+        final = "UNKNOWN"
+        note = (
+            f"insufficient ML confidence; "
+            f"ML suggested {ml_label}, rule engine estimated {rule_label}"
+        )
 
-    agreement = "yes" if ml_label == rule_label else "no"
+    ranked = sorted(range(len(proba)), key=lambda i: -proba[i])[:3]
+    top3 = ", ".join(f"{order[i]}={proba[i]:.2f}" for i in ranked)
 
     return [create_finding(
         rule_id="HYBRID_TIME_COMPLEXITY",
@@ -197,10 +226,11 @@ def estimate_time_complexity_hybrid(representation):
         line=1,
         column=0,
         severity="info",
-        confidence=round(conf, 3),
+        confidence=round(ml_conf, 3),
         evidence=(
-            f"Rule estimate: {rule_label} | ML estimate: {ml_label} ({ml_conf:.2f}) "
-            f"| Agreement: {agreement} | ML top3: {top3}"
+            f"Status: {status} | Rule estimate: {rule_label} | "
+            f"ML estimate: {ml_label} ({ml_conf:.2f}) | "
+            f"Agreement: {'yes' if agree else 'no'} | ML top3: {top3}"
         ),
     )]
 

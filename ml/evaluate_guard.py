@@ -1,16 +1,3 @@
-"""
-Does the safety net keep the model's accuracy?
-
-Run from the project root:
-    python -m ml.evaluate_guard
-
-Uses the same grouped cross-validation as ml/experiment_models.py (test
-problems are never seen in training) and compares:
-  * rule engine alone
-  * ML alone
-  * ML with a fallback to the rules when the model is unsure
-    (confidence below the limit) and/or far from the rules (gap >= 2 classes)
-"""
 
 import argparse
 import json
@@ -83,6 +70,12 @@ def main():
     y = np.array([CLASS_ORDER.index(row["complexity"]) for row in rows])
     groups = np.array([row["problem"] for row in rows])
     rule = np.array([CLASS_ORDER.index(rule_based_estimate(f)) for f in features])
+    lines = np.array([
+        sum(1 for line in row["src"].splitlines() if line.strip()) for row in rows
+    ])
+    print("Program length (non-empty lines): median", int(np.median(lines)),
+          "| shortest", int(lines.min()),
+          "| programs under 12 lines:", int((lines < 12).sum()))
     extras = [extra_features(row["src"]) for row in rows]
     X = np.hstack([
         np.array([[f[n] for n in FEATURE_NAMES] for f in features], dtype=float),
@@ -91,13 +84,15 @@ def main():
     ])
 
     variants = {
-        "Rule engine alone": lambda p, c, r: r,
-        "ML alone": lambda p, c, r: p,
-        "ML, fallback to rules if gap >= 2": lambda p, c, r: np.where(np.abs(p - r) >= 2, r, p),
-        "ML, fallback to rules if conf < 0.40": lambda p, c, r: np.where(c < 0.40, r, p),
-        "ML, fallback to rules if conf < 0.50": lambda p, c, r: np.where(c < 0.50, r, p),
-        "ML, fallback if conf < 0.50 or gap >= 2 (agent)": lambda p, c, r: np.where((c < 0.50) | (np.abs(p - r) >= 2), r, p),
+        "Rule engine alone": lambda p, c, r, n: r,
+        "ML alone": lambda p, c, r, n: p,
+        "ML, fallback to rules if conf < 0.40": lambda p, c, r, n: np.where(c < 0.40, r, p),
+        "ML, fallback if conf < 0.40 or under 8 lines": lambda p, c, r, n: np.where((c < 0.40) | (n < 8), r, p),
+        "ML, fallback if conf < 0.40 or under 12 lines (agent)": lambda p, c, r, n: np.where((c < 0.40) | (n < 12), r, p),
+        "ML, fallback if conf < 0.40 or under 16 lines": lambda p, c, r, n: np.where((c < 0.40) | (n < 16), r, p),
     }
+    buckets = [("up to 8 lines", 0, 8), ("9-15 lines", 9, 15), ("16-30 lines", 16, 30), ("31+ lines", 31, 10 ** 9)]
+    bucket_stats = {name: [0, 0, 0] for name, _, _ in buckets}  # count, rule correct, ML correct
     scores = {name: [] for name in variants}
 
     for seed in range(args.seeds):
@@ -118,7 +113,13 @@ def main():
             conf = proba.max(axis=1)
 
             for name, choose in variants.items():
-                scores[name].append(metrics(y[test], choose(pred, conf, rule[test])))
+                scores[name].append(metrics(y[test], choose(pred, conf, rule[test], lines[test])))
+
+            for name, low, high in buckets:
+                mask = (lines[test] >= low) & (lines[test] <= high)
+                bucket_stats[name][0] += int(mask.sum())
+                bucket_stats[name][1] += int((rule[test][mask] == y[test][mask]).sum())
+                bucket_stats[name][2] += int((pred[mask] == y[test][mask]).sum())
 
     base = np.array([s[0] for s in scores["Rule engine alone"]])
 
@@ -135,6 +136,16 @@ def main():
         )
     print()
     print("'vs rule' = accuracy difference to the rule engine on the same folds.")
+
+    print()
+    print(f"{'program length':<18}{'programs':>10}{'rule acc':>10}{'ML acc':>9}")
+    print("-" * 47)
+    for name, _, _ in buckets:
+        count, rule_ok, ml_ok = bucket_stats[name]
+        if count:
+            print(f"{name:<18}{count:>10}{rule_ok / count:>10.3f}{ml_ok / count:>9.3f}")
+        else:
+            print(f"{name:<18}{0:>10}")
 
 
 if __name__ == "__main__":
