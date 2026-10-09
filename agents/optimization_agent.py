@@ -1,19 +1,3 @@
-"""
-Optimization Agent (goal / utility based).
-
-Goal:   reduce the computational cost of the analyzed program while
-        preserving its behaviour.
-State:  the parsed code + loop information from the Code Understanding module.
-Actions (candidate recommendations):
-        HOIST_SORT          - move a repeated sort out of a loop
-        USE_SET_MEMBERSHIP  - replace list membership tests with a set
-        REVIEW_NESTED_LOOPS - advisory: look for lookup / precomputation
-Utility: 0.6 * gain - 0.15 * effort - 0.25 * risk   (each term in [0, 1])
-         Candidates are ranked by utility, then reported as findings.
-
-Recommendations are suggestions, never automatic rewrites: the agent cannot
-prove that a change preserves behaviour.
-"""
 
 import ast
 
@@ -25,17 +9,40 @@ from agents.code_understanding import get_loop_bound_type
 W_GAIN, W_EFFORT, W_RISK = 0.6, 0.15, 0.25
 HIGH_PRIORITY, MEDIUM_PRIORITY = 0.40, 0.20
 
+# "Do nothing" has utility 0, so a recommendation must beat that. Raise this
+# (e.g. to 0.05) to also silence weak advisories such as OPT_NESTED_LOOPS.
+MIN_UTILITY = 0.0
+
+FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+
 MUTATORS = {
     "append", "extend", "insert", "remove", "pop", "clear",
     "add", "discard", "update", "reverse", "sort",
 }
+# Calls known not to modify their arguments / receiver. Any OTHER call that
+# receives a name (e.g. random.shuffle(arr), heappush(h, x), process(arr)) is
+# assumed to possibly modify it.
+PURE_CALLS = {
+    "len", "sorted", "print", "range", "min", "max", "sum", "abs", "enumerate",
+    "zip", "str", "int", "float", "bool", "list", "set", "tuple", "dict",
+    "frozenset", "isinstance", "reversed", "any", "all", "round", "repr",
+    "format", "sqrt", "floor", "ceil", "pow", "log", "hash", "ord", "chr",
+    "count", "index", "get", "keys", "values", "items", "copy", "join",
+    "startswith", "endswith", "lower", "upper", "strip", "split",
+}
+# A membership test against a list of at most this many constant elements is
+# already cheap: a set would not help.
+SMALL_LIST_MAX = 8
+# Methods that only dicts / sets have: calling one on a parameter is strong
+# evidence that it is NOT a list.
+HASHED_METHODS = {"get", "items", "keys", "values", "setdefault", "add", "discard"}
 LOOP_NODES = (ast.For, ast.While)
 COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
-# ---------------------------------------------------------------
+
 # Utility function
-# ---------------------------------------------------------------
+
 def compute_utility(gain, effort, risk):
     return round(W_GAIN * gain - W_EFFORT * effort - W_RISK * risk, 3)
 
@@ -49,67 +56,104 @@ def priority_from_utility(utility):
 
 
 def _gain(base, loops):
-    """Gain grows with loop depth and shrinks if every enclosing loop is
-    constant-bounded (e.g. range(3)), where the saving is negligible."""
-    gain = min(1.0, base + 0.05 * (len(loops) - 1))
-    if all(get_loop_bound_type(loop) == "constant" for loop in loops):
-        gain *= 0.3
-    return gain
+    """Gain grows with loop depth. If every enclosing loop has a constant
+    bound (e.g. range(3)) the repeated work is O(1) in total, so the
+    asymptotic gain is zero."""
+    if loops and all(get_loop_bound_type(loop) == "constant" for loop in loops):
+        return 0.0
+    return min(1.0, base + 0.05 * (len(loops) - 1))
 
 
-# ---------------------------------------------------------------
+
 # AST helpers
-# ---------------------------------------------------------------
-def _collect(node, loops, out):
-    """Record every node with the list of loops it executes inside.
-    Comprehensions count as loops. A function body resets the loop stack."""
-    out.append((node, loops))
 
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+def _collect(node, loops, out, scope):
+    """Record every node with the loops it executes inside and the function
+    (or module) scope it belongs to. Comprehensions count as loops. A
+    function body resets the loop stack and starts a new scope."""
+    out.append((node, loops, scope))
+
+    if isinstance(node, FUNCTIONS):
         for child in ast.iter_child_nodes(node):
-            _collect(child, [], out)
+            _collect(child, [], out, node)
     elif isinstance(node, ast.For):
         # target and iterable are evaluated outside the repeated body
-        _collect(node.target, loops, out)
-        _collect(node.iter, loops, out)
+        _collect(node.target, loops, out, scope)
+        _collect(node.iter, loops, out, scope)
         for stmt in node.body + node.orelse:
-            _collect(stmt, loops + [node], out)
+            _collect(stmt, loops + [node], out, scope)
     elif isinstance(node, (ast.While,) + COMPREHENSIONS):
         for child in ast.iter_child_nodes(node):
-            _collect(child, loops + [node], out)
+            _collect(child, loops + [node], out, scope)
     else:
         for child in ast.iter_child_nodes(node):
-            _collect(child, loops, out)
+            _collect(child, loops, out, scope)
+
+
+def _root_name(node):
+    """self.items.append -> 'self', arr[i].x -> 'arr', arr -> 'arr'."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _call_name(call):
+    f = call.func
+    if isinstance(f, ast.Name):
+        return f.id
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    return None
 
 
 def _modified_names(loop, ignore=None):
-    """Names that are assigned or mutated anywhere inside the loop."""
+    """Names that are assigned or possibly mutated anywhere inside the loop.
+    Conservative: when unsure, a name counts as modified."""
     names = set()
 
     for n in ast.walk(loop):
         if n is ignore:
             continue
+
         if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
             names.add(n.id)
-        elif (
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr in MUTATORS
-            and isinstance(n.func.value, ast.Name)
-        ):
-            names.add(n.func.value.id)
-        elif (
-            isinstance(n, ast.Subscript)
-            and isinstance(n.ctx, (ast.Store, ast.Del))
-            and isinstance(n.value, ast.Name)
-        ):
-            names.add(n.value.id)
+
+        elif isinstance(n, ast.Subscript) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            root = _root_name(n.value)
+            if root:
+                names.add(root)
+
+        elif isinstance(n, ast.Call):
+            name = _call_name(n)
+
+            # receiver of a mutating method: arr.append(..), self.items.append(..)
+            if isinstance(n.func, ast.Attribute):
+                root = _root_name(n.func.value)
+                if root and (name in MUTATORS or name not in PURE_CALLS):
+                    names.add(root)
+
+            # arguments of a call we cannot vouch for: random.shuffle(arr)
+            if name not in PURE_CALLS and name not in MUTATORS:
+                for arg in list(n.args) + [k.value for k in n.keywords]:
+                    if isinstance(arg, ast.Starred):
+                        arg = arg.value
+                    root = _root_name(arg)
+                    if root:
+                        names.add(root)
 
     return names
 
 
 def _value_kind(value):
-    if isinstance(value, (ast.List, ast.ListComp)):
+    if isinstance(value, ast.List):
+        if (
+            value.elts
+            and len(value.elts) <= SMALL_LIST_MAX
+            and all(isinstance(e, ast.Constant) for e in value.elts)
+        ):
+            return "small"
+        return "list"
+    if isinstance(value, ast.ListComp):
         return "list"
     if isinstance(value, (ast.Set, ast.SetComp, ast.Dict, ast.DictComp)):
         return "hashed"
@@ -121,22 +165,74 @@ def _value_kind(value):
     return "other"
 
 
+def _walk_own(scope):
+    """Walk a scope's nodes without entering nested function definitions."""
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        n = stack.pop()
+        yield n
+        if isinstance(n, FUNCTIONS):
+            continue
+        stack.extend(ast.iter_child_nodes(n))
+
+
 def _infer_kinds(tree):
-    """Best-effort guess of what each name holds: list / hashed / param.
-    Python has no static types, so this is only a heuristic."""
-    kinds = {}
+    """Best-effort guess of what each name holds (list / hashed / param),
+    kept PER SCOPE so a variable in one function cannot affect another.
+    Returns {scope_node: {name: kind}}. Python has no static types, so this
+    is only a heuristic."""
+    scopes = {}
 
-    for n in ast.walk(tree):
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for arg in n.args.args + n.args.kwonlyargs:
-                kinds.setdefault(arg.arg, "param")
-        elif isinstance(n, ast.Assign):
-            kind = _value_kind(n.value)
-            for target in n.targets:
-                if isinstance(target, ast.Name):
-                    kinds[target.id] = kind
+    def build(scope, inherited):
+        kinds = dict(inherited)
 
-    return kinds
+        if isinstance(scope, FUNCTIONS):
+            args = scope.args
+            for arg in args.posonlyargs + args.args + args.kwonlyargs:
+                kinds[arg.arg] = "param"
+
+        for n in _walk_own(scope):
+            if isinstance(n, ast.Assign):
+                kind = _value_kind(n.value)
+                for target in n.targets:
+                    if isinstance(target, ast.Name):
+                        kinds[target.id] = kind
+
+        # usage evidence: a parameter with .get() / .items() / .add() ... called
+        # on it is a dict or set, not a list
+        for n in _walk_own(scope):
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in HASHED_METHODS
+                and isinstance(n.func.value, ast.Name)
+                and kinds.get(n.func.value.id) == "param"
+            ):
+                kinds[n.func.value.id] = "hashed"
+
+        scopes[scope] = kinds
+
+        for n in _walk_own(scope):
+            if isinstance(n, FUNCTIONS):
+                build(n, kinds)
+
+    build(tree, {})
+    return scopes
+
+
+def _indexed_by_tested_key(name, key, loop):
+    """True for the dict idiom `if k in d: ... d[k]`. A list indexed by the very
+    value that was just tested for membership would make no sense."""
+    key_dump = ast.dump(key)
+    for n in ast.walk(loop):
+        if (
+            isinstance(n, ast.Subscript)
+            and isinstance(n.value, ast.Name)
+            and n.value.id == name
+            and ast.dump(n.slice) == key_dump
+        ):
+            return True
+    return False
 
 
 def _is_sort_call(call):
@@ -147,9 +243,9 @@ def _is_sort_call(call):
     )
 
 
-# ---------------------------------------------------------------
+
 # Pattern detectors: each returns candidate recommendations
-# ---------------------------------------------------------------
+
 def _candidate(rule_id, node, message, gain, effort, risk, confidence,
                current, potential, why):
     utility = compute_utility(gain, effort, risk)
@@ -171,7 +267,7 @@ def _candidate(rule_id, node, message, gain, effort, risk, confidence,
 def detect_sort_in_loop(nodes):
     candidates = []
 
-    for node, loops in nodes:
+    for node, loops, _scope in nodes:
         if not loops or not isinstance(node, ast.Call) or not _is_sort_call(node):
             continue
 
@@ -197,11 +293,13 @@ def detect_sort_in_loop(nodes):
 
 def detect_list_membership_in_loop(tree, nodes):
     candidates = []
-    kinds = _infer_kinds(tree)
+    scope_kinds = _infer_kinds(tree)
 
-    for node, loops in nodes:
+    for node, loops, scope in nodes:
         if not loops or not isinstance(node, ast.Compare):
             continue
+
+        kinds = scope_kinds.get(scope, {})
 
         for op, comparator in zip(node.ops, node.comparators):
             if not isinstance(op, (ast.In, ast.NotIn)):
@@ -210,11 +308,20 @@ def detect_list_membership_in_loop(tree, nodes):
                 continue
 
             kind = kinds.get(comparator.id)
-            if kind not in ("list", "param"):
+            if kind not in ("list", "param", "small"):
                 continue
 
             name = comparator.id
             changes = name in _modified_names(loops[-1])
+
+            # tiny constant list that never changes: a set gains nothing
+            if kind == "small":
+                if not changes:
+                    continue
+                kind = "list"  # it grows in the loop, so it is a real list
+
+            if _indexed_by_tested_key(name, node.left, loops[-1]):
+                continue
             risk = 0.5 if changes else 0.15
             confidence = 0.80 if kind == "list" else 0.50
             hedge = "" if kind == "list" else f" (if '{name}' is a list)"
@@ -234,15 +341,44 @@ def detect_list_membership_in_loop(tree, nodes):
 
     return candidates
 
+def _writes_nested_subscript(loop):
+    for node in ast.walk(loop):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            for target in targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Subscript)
+                ):
+                    return True
+    return False
 
 def detect_nested_loops(representation):
     candidates = []
+
+    try:
+        tree = ast.parse(representation["code"])
+    except (SyntaxError, KeyError):
+        return candidates
+
+    loops_by_line = {
+        node.lineno: node
+        for node in ast.walk(tree)
+        if isinstance(node, LOOP_NODES)
+    }
 
     for loop in representation["features"].get("loop_details", []):
         if loop["nesting_depth"] < 2 or loop["bound_type"] == "constant":
             continue
 
-        class _At:  # minimal stand-in carrying the line number
+        node = loops_by_line.get(loop["line"])
+        if node is not None and _writes_nested_subscript(node):
+            continue
+
+        class _At:
             lineno = loop["line"]
             col_offset = 0
 
@@ -254,14 +390,14 @@ def detect_nested_loops(representation):
             current="O(n^2) or worse", potential="may be reducible",
             why=f"loop at depth {loop['nesting_depth']} with {loop['bound_type']} bound",
         ))
-        break  # one advisory per program is enough
+        break
 
     return candidates
 
 
-# ---------------------------------------------------------------
+
 # Agent entry point
-# ---------------------------------------------------------------
+
 def detect_optimizations(representation):
     try:
         tree = ast.parse(representation["code"])
@@ -269,16 +405,19 @@ def detect_optimizations(representation):
         return []
 
     nodes = []
-    _collect(tree, [], nodes)
+    _collect(tree, [], nodes, tree)
 
     candidates = []
     candidates.extend(detect_sort_in_loop(nodes))
     candidates.extend(detect_list_membership_in_loop(tree, nodes))
     candidates.extend(detect_nested_loops(representation))
 
-    # De-duplicate, then rank by utility (the agent's decision step)
+    # Decision step: drop anything that does not beat "do nothing",
+    # de-duplicate, then rank by utility.
     unique = {}
     for c in candidates:
+        if c["utility"] <= MIN_UTILITY:
+            continue
         unique.setdefault((c["rule_id"], c["line"]), c)
 
     ranked = sorted(unique.values(), key=lambda c: -c["utility"])
@@ -299,9 +438,9 @@ def detect_optimizations(representation):
     ]
 
 
-# ---------------------------------------------------------------
+
 # Self-check: one positive and one negative case per pattern
-# ---------------------------------------------------------------
+
 EXAMPLES = {
     "sort in loop (positive)": ("""
 def f(arr, n):

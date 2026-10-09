@@ -134,25 +134,41 @@ def get_max_loop_nesting(node, depth=0):
 
     return max_depth
 
+
+
+def _is_const_expr(node):
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp):
+        return _is_const_expr(node.operand)
+    if isinstance(node, ast.BinOp):
+        return _is_const_expr(node.left) and _is_const_expr(node.right)
+    return False
+
 def get_loop_bound_type(node):
-    if not isinstance(node, ast.For):
-        return "unknown"
+    if isinstance(node, ast.For):
+        iterator = node.iter
 
-    iterable = node.iter
+        if (
+            isinstance(iterator, ast.Call)
+            and isinstance(iterator.func, ast.Name)
+            and iterator.func.id == "range"
+        ):
+            # range(3), range(0, 3), range(1, 10, 2): constant when EVERY
+            # argument is a constant expression
+            if iterator.args and all(_is_const_expr(a) for a in iterator.args):
+                return "constant"
 
-    if isinstance(iterable, ast.Call):
-        if isinstance(iterable.func, ast.Name) and iterable.func.id == "range":
-            for arg in iterable.args:
-                if isinstance(arg, ast.Constant):
-                    continue
-                return "input-dependent"
+            return "input-dependent"
+
+        # for x in [1, 2, 3] / (1, 2) / {1, 2}
+        if (
+            isinstance(iterator, (ast.List, ast.Tuple, ast.Set))
+            and all(_is_const_expr(e) for e in iterator.elts)
+        ):
             return "constant"
 
-    if isinstance(iterable, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Constant)):
-        return "constant"
-
-    if isinstance(iterable, ast.Name):
-        return "input-dependent"
+        return "unknown"
 
     return "unknown"
 
